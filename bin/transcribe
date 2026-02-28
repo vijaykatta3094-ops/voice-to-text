@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Voice-to-text transcription using faster-whisper
+# Usage:
+#   transcribe <audio_file>              # Transcribe a file (auto-detect language)
+#   transcribe <audio_file> en           # Transcribe with explicit language
+#   transcribe <audio_file> en large-v3  # Specify model size (tiny/base/small/medium/large-v3)
+#
+# Supported formats: mp3, wav, flac, ogg, m4a, webm, mp4, and more
+
+set -euo pipefail
+
+VENV="$HOME/faster-whisper-env"
+PYTHON="$VENV/bin/python3"
+
+if [ ! -f "$PYTHON" ]; then
+    echo "Error: faster-whisper venv not found at $VENV"
+    echo "Re-run the setup to install it."
+    exit 1
+fi
+
+AUDIO_FILE="${1:-}"
+LANGUAGE="${2:-en}"
+MODEL="${3:-large-v3}"
+
+if [ -z "$AUDIO_FILE" ]; then
+    echo "Usage: transcribe <audio_file> [language] [model]"
+    echo ""
+    echo "  language: en, es, fr, de, zh, ja, ko, hi, etc. (default: en)"
+    echo "  model:    tiny, base, small, medium, large-v3 (default: large-v3)"
+    echo ""
+    echo "Examples:"
+    echo "  transcribe recording.mp3"
+    echo "  transcribe meeting.wav en medium"
+    echo "  transcribe interview.m4a es"
+    exit 0
+fi
+
+if [ ! -f "$AUDIO_FILE" ]; then
+    echo "Error: File not found: $AUDIO_FILE"
+    exit 1
+fi
+
+exec "$PYTHON" -c "
+import sys
+from faster_whisper import WhisperModel
+
+audio_file = sys.argv[1]
+language = sys.argv[2]
+model_size = sys.argv[3]
+
+print(f'Loading model: {model_size} (first run downloads the model)...')
+model = WhisperModel(model_size, device='auto', compute_type='auto')
+
+print(f'Transcribing: {audio_file} (language: {language})')
+print('---')
+
+segments, info = model.transcribe(audio_file, language=language, beam_size=5)
+
+print(f'Detected language: {info.language} (probability: {info.language_probability:.2f})')
+print('---')
+
+for segment in segments:
+    print('[%.2fs -> %.2fs] %s' % (segment.start, segment.end, segment.text))
+" "$AUDIO_FILE" "$LANGUAGE" "$MODEL"

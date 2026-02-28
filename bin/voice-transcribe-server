@@ -1,0 +1,97 @@
+#!/home/vijay-katta/faster-whisper-env/bin/python3
+"""Persistent transcription server. Keeps model loaded in GPU memory for instant transcription."""
+import socket
+import os
+import sys
+import signal
+import warnings
+import logging
+import time
+
+warnings.filterwarnings('ignore')
+for name in ['nemo', 'pytorch_lightning', 'nemo.collections', 'nemo.utils',
+             'nemo.core', 'torch', 'transformers']:
+    logging.getLogger(name).setLevel(logging.CRITICAL)
+os.environ['NEMO_LOG_LEVEL'] = 'CRITICAL'
+os.environ['HYDRA_FULL_ERROR'] = '0'
+
+SOCKET_PATH = "/tmp/voice-transcribe.sock"
+PID_FILE = "/tmp/voice-transcribe-server.pid"
+
+def load_parakeet():
+    import nemo.utils.nemo_logging
+    nemo.utils.nemo_logging.Logger().setLevel(logging.CRITICAL)
+    import nemo.collections.asr as nemo_asr
+    from omegaconf import open_dict
+    model = nemo_asr.models.ASRModel.from_pretrained('nvidia/parakeet-tdt-0.6b-v3')
+    model.eval()
+    with open_dict(model.cfg):
+        model.cfg.decoding.greedy.use_cuda_graph_decoder = False
+    model.change_decoding_strategy(model.cfg.decoding)
+    return model
+
+def transcribe(model, audio_file):
+    result = model.transcribe([audio_file])
+    if isinstance(result, list) and len(result) > 0:
+        r = result[0]
+        return r.text if hasattr(r, 'text') else str(r)
+    return str(result)
+
+def cleanup(signum=None, frame=None):
+    try: os.unlink(SOCKET_PATH)
+    except: pass
+    try: os.unlink(PID_FILE)
+    except: pass
+    sys.exit(0)
+
+def main():
+    # Write PID file
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    # Remove stale socket
+    try: os.unlink(SOCKET_PATH)
+    except FileNotFoundError: pass
+
+    # Load model (one-time cost)
+    print("Loading Parakeet model...", flush=True)
+    t0 = time.time()
+    model = load_parakeet()
+    print(f"Model loaded in {time.time()-t0:.1f}s. Ready for transcription.", flush=True)
+
+    # Start Unix socket server
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
+    server.listen(1)
+    server.settimeout(None)
+
+    while True:
+        conn, _ = server.accept()
+        try:
+            data = conn.recv(4096).decode('utf-8').strip()
+            if data == "PING":
+                conn.sendall(b"PONG")
+            elif data == "SHUTDOWN":
+                conn.sendall(b"OK")
+                conn.close()
+                cleanup()
+            elif os.path.isfile(data):
+                t0 = time.time()
+                text = transcribe(model, data)
+                elapsed = time.time() - t0
+                response = f"{text}\n__TIME__{elapsed:.2f}"
+                conn.sendall(response.encode('utf-8'))
+            else:
+                conn.sendall(b"ERROR: file not found")
+        except Exception as e:
+            try: conn.sendall(f"ERROR: {e}".encode('utf-8'))
+            except: pass
+        finally:
+            conn.close()
+
+if __name__ == "__main__":
+    main()

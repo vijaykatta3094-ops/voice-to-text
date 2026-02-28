@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# Toggle voice-to-text: press hotkey to start recording, press again to stop & transcribe.
+# The transcribed text is copied to clipboard and pasted into the active window.
+
+set -euo pipefail
+
+# Ensure environment is set (GNOME keybindings strip these)
+export HOME="${HOME:-/home/vijay-katta}"
+export DISPLAY="${DISPLAY:-:1}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+PIDFILE="/tmp/voice-to-text.pid"
+AUDIO_FILE="/tmp/voice-to-text-recording.wav"
+LOGFILE="/tmp/voice-to-text.log"
+VENV="$HOME/faster-whisper-env"
+PYTHON="$VENV/bin/python3"
+BT_STATE_FILE="/tmp/voice-to-text-bt-state"
+SCO_KEEPALIVE_PID_FILE="/tmp/voice-to-text-sco-keepalive.pid"
+
+# Engine config: parakeet (GPU, fastest+accurate) or whisper (CPU, lighter)
+export VOICE_ENGINE="${VOICE_ENGINE:-parakeet}"
+export VOICE_MODEL="${VOICE_MODEL:-base}"
+export VOICE_LANG="${VOICE_LANG:-en}"
+
+log() {
+    echo "$(date '+%H:%M:%S') $1" >> "$LOGFILE"
+}
+
+notify() {
+    notify-send -t 2000 "Voice-to-Text" "$1" 2>/dev/null || true
+}
+
+# Switch Bluetooth to HFP (mic) profile and pin it as default source.
+# Saves previous profile+source to BT_STATE_FILE so restore_audio can undo it.
+# Falls back to built-in mic if BT is unavailable.
+setup_audio() {
+    BT_CARD=$(pactl list cards short 2>/dev/null | grep bluez | awk '{print $2}' | head -1)
+
+    if [ -n "$BT_CARD" ]; then
+        SAVED_PROFILE=$(pactl list cards 2>/dev/null | awk "/Name: $BT_CARD/{f=1} f && /Active Profile:/{print \$3; exit}")
+        SAVED_SOURCE=$(pactl info 2>/dev/null | awk '/Default Source:/{print $3}')
+
+        if pactl set-card-profile "$BT_CARD" headset-head-unit-msbc 2>/dev/null; then
+            # Wait up to 1s for the HFP source to appear
+            BT_SOURCE=""
+            for i in 1 2 3 4 5; do
+                BT_SOURCE=$(pactl list sources short 2>/dev/null | grep "bluez_input" | awk '{print $2}' | head -1)
+                [ -n "$BT_SOURCE" ] && break
+                sleep 0.2
+            done
+
+            if [ -n "$BT_SOURCE" ]; then
+                pactl set-default-source "$BT_SOURCE" 2>/dev/null || true
+                printf '%s\n%s\n%s\n' "$BT_CARD" "$SAVED_PROFILE" "$SAVED_SOURCE" > "$BT_STATE_FILE"
+                log "Audio: BT HFP mic ($BT_SOURCE) | was: profile=$SAVED_PROFILE source=$SAVED_SOURCE"
+                return
+            fi
+        fi
+        log "Audio: BT HFP switch failed, falling back to built-in"
+    fi
+
+    # Fall back to built-in mic (alsa_input, never a monitor)
+    BUILTIN=$(pactl list sources short 2>/dev/null | grep "alsa_input" | awk '{print $2}' | head -1)
+    if [ -n "$BUILTIN" ]; then
+        pactl set-default-source "$BUILTIN" 2>/dev/null || true
+        log "Audio: built-in mic ($BUILTIN)"
+    fi
+}
+
+# Play silence to BT HFP sink to keep the SCO link alive during recording.
+# Without this, the headset drops the SCO link after ~3-5s (it thinks the call ended).
+start_sco_keepalive() {
+    BT_SINK=$(pactl list sinks short 2>/dev/null | grep "bluez_output" | grep -v "monitor" | awk '{print $2}' | head -1)
+    if [ -n "$BT_SINK" ]; then
+        cat /dev/zero | pacat --playback --device="$BT_SINK" --channels=1 --rate=16000 --format=s16le 2>/dev/null &
+        echo $! > "$SCO_KEEPALIVE_PID_FILE"
+        log "SCO keepalive started (sink=$BT_SINK)"
+    fi
+}
+
+stop_sco_keepalive() {
+    if [ -f "$SCO_KEEPALIVE_PID_FILE" ]; then
+        KA_PID=$(cat "$SCO_KEEPALIVE_PID_FILE")
+        rm -f "$SCO_KEEPALIVE_PID_FILE"
+        # Kill both pacat and its cat /dev/zero parent
+        kill "$KA_PID" 2>/dev/null || true
+        pkill -P "$KA_PID" 2>/dev/null || true
+        log "SCO keepalive stopped"
+    fi
+}
+
+# Restore BT profile and default source to what they were before recording.
+restore_audio() {
+    stop_sco_keepalive
+    if [ -f "$BT_STATE_FILE" ]; then
+        BT_CARD=$(sed -n '1p' "$BT_STATE_FILE")
+        SAVED_PROFILE=$(sed -n '2p' "$BT_STATE_FILE")
+        SAVED_SOURCE=$(sed -n '3p' "$BT_STATE_FILE")
+        rm -f "$BT_STATE_FILE"
+        [ -n "$SAVED_PROFILE" ] && pactl set-card-profile "$BT_CARD" "$SAVED_PROFILE" 2>/dev/null || true
+        [ -n "$SAVED_SOURCE" ] && pactl set-default-source "$SAVED_SOURCE" 2>/dev/null || true
+        log "Audio restored: profile=$SAVED_PROFILE source=$SAVED_SOURCE"
+    fi
+}
+
+start_recording() {
+    setup_audio
+    start_sco_keepalive
+    log "START recording (engine=$VOICE_ENGINE)"
+    rm -f /tmp/voice-to-text.ready
+    nohup "$PYTHON" "$HOME/bin/voice-recorder-daemon" "$AUDIO_FILE" </dev/null >/dev/null 2>&1 &
+    disown
+    # Wait for daemon to signal stream is actually open (up to 3s)
+    for i in $(seq 1 30); do
+        [ -f /tmp/voice-to-text.ready ] && break
+        sleep 0.1
+    done
+    notify "Recording... Press Ctrl+Space to stop."
+    log "Recording PID: $(cat "$PIDFILE" 2>/dev/null || echo 'unknown')"
+}
+
+stop_and_transcribe() {
+    PID=$(cat "$PIDFILE" 2>/dev/null)
+    rm -f "$PIDFILE"
+    log "STOP recording, killing PID=$PID"
+
+    if [ -n "$PID" ]; then
+        kill -TERM "$PID" 2>/dev/null || true
+        for i in $(seq 1 50); do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        sleep 0.3
+    fi
+
+    # Check if daemon self-stopped due to BT dropout
+    if [ -f /tmp/voice-to-text.dropout ]; then
+        rm -f /tmp/voice-to-text.dropout
+        log "WARNING: BT mic dropped mid-recording — partial audio captured"
+        notify "BT mic dropped! Will transcribe what was captured."
+    fi
+
+    if [ ! -f "$AUDIO_FILE" ] || [ ! -s "$AUDIO_FILE" ]; then
+        log "ERROR: No audio file or empty"
+        notify "No audio recorded."
+        restore_audio
+        exit 1
+    fi
+
+    log "Audio file size: $(wc -c < "$AUDIO_FILE") bytes"
+
+    # Detect silence — means mic was disconnected or wrong source
+    MAX_AMP=$("$PYTHON" -c "
+import wave, struct
+with wave.open('$AUDIO_FILE', 'rb') as wf:
+    data = wf.readframes(wf.getnframes())
+samples = struct.unpack('<' + 'h'*(len(data)//2), data)
+print(max(abs(s) for s in samples))
+" 2>/dev/null || echo "0")
+    if [ "$MAX_AMP" -lt 100 ] 2>/dev/null; then
+        log "ERROR: Recording is silence (max_amp=$MAX_AMP) — mic issue. Source: $(pactl info 2>/dev/null | awk '/Default Source:/{print $3}')"
+        notify "Mic not working! Check audio source."
+        cp "$AUDIO_FILE" /tmp/voice-to-text-last.wav 2>/dev/null || true
+        rm -f "$AUDIO_FILE"
+        restore_audio
+        exit 1
+    fi
+
+    TEXT=$("$PYTHON" "$HOME/bin/voice-transcribe-engine" "$AUDIO_FILE" 2>>"$LOGFILE") || true
+
+    # Keep a copy of last recording for debugging
+    cp "$AUDIO_FILE" /tmp/voice-to-text-last.wav 2>/dev/null || true
+    rm -f "$AUDIO_FILE"
+    log "Transcribed text: [$TEXT]"
+
+    if [ -z "$TEXT" ]; then
+        notify "No speech detected."
+        log "No speech detected"
+        restore_audio
+        exit 0
+    fi
+
+    # Save current clipboard so we can restore it after pasting
+    SAVED_CLIPBOARD=$(wl-paste 2>/dev/null || true)
+
+    # Copy transcribed text to clipboard and paste
+    printf '%s' "$TEXT" | wl-copy
+    log "Copied to clipboard"
+
+    # Paste using ydotool (kernel-level input, works on GNOME Wayland)
+    sleep 0.3
+    ydotool key ctrl+shift+v 2>>"$LOGFILE"
+    log "Pasted with ydotool (ctrl+shift+v)"
+
+    # Restore original clipboard content
+    sleep 0.3
+    if [ -n "$SAVED_CLIPBOARD" ]; then
+        printf '%s' "$SAVED_CLIPBOARD" | wl-copy 2>/dev/null || true
+    else
+        wl-copy --clear 2>/dev/null || true
+    fi
+    log "Clipboard restored"
+
+    restore_audio
+    notify "Done: $TEXT"
+    log "DONE"
+}
+
+# Toggle logic
+log "--- Script invoked ---"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    # Daemon is alive — normal stop
+    stop_and_transcribe
+elif [ -f "$PIDFILE" ] && { [ -f /tmp/voice-to-text.dropout ] || [ -f "$AUDIO_FILE" ]; }; then
+    # Daemon died early (BT dropout) but left audio — transcribe what we captured
+    log "Daemon died early (BT dropout?), transcribing partial audio"
+    stop_and_transcribe
+else
+    rm -f "$PIDFILE" "$AUDIO_FILE" /tmp/voice-to-text.ready /tmp/voice-to-text.dropout
+    start_recording
+fi
