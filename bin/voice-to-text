@@ -20,13 +20,20 @@ PYTHON="$VENV/bin/python3"
 BT_STATE_FILE="/tmp/voice-to-text-bt-state"
 SCO_KEEPALIVE_PID_FILE="/tmp/voice-to-text-sco-keepalive.pid"
 
+# Persistent log — survives reboots, one file per day
+PERSIST_LOG_DIR="$HOME/voice-to-text/logs"
+mkdir -p "$PERSIST_LOG_DIR"
+PERSIST_LOG="$PERSIST_LOG_DIR/$(date '+%Y-%m-%d').log"
+
 # Engine config: parakeet (GPU, fastest+accurate) or whisper (CPU, lighter)
 export VOICE_ENGINE="${VOICE_ENGINE:-parakeet}"
 export VOICE_MODEL="${VOICE_MODEL:-base}"
 export VOICE_LANG="${VOICE_LANG:-en}"
 
 log() {
-    echo "$(date '+%H:%M:%S') $1" >> "$LOGFILE"
+    local msg="$(date '+%H:%M:%S') $1"
+    echo "$msg" >> "$LOGFILE"
+    echo "$msg" >> "$PERSIST_LOG"
 }
 
 notify() {
