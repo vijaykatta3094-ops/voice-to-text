@@ -6,10 +6,12 @@ import wave
 import os
 import queue
 import threading
+import numpy as np
 import sounddevice as sd
 
 AUDIO_FILE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/hoot-recording.wav"
 READY_FILE = "/tmp/hoot.ready"
+LEVEL_FILE = "/tmp/hoot.level"
 RATE = 16000
 CHANNELS = 1
 
@@ -48,6 +50,17 @@ def main():
             had_speech[0] = True
         audio_queue.put(data)
 
+    def write_level(data):
+        """Compute RMS amplitude and write normalized level (0.0–1.0) for the panel indicator."""
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        rms = np.sqrt(np.mean(samples ** 2))
+        level = min(1.0, rms / 8000.0)
+        try:
+            with open(LEVEL_FILE, 'w') as lf:
+                lf.write(f"{level:.3f}")
+        except OSError:
+            pass
+
     def handle_signal(signum, frame):
         stopped.set()
 
@@ -73,6 +86,7 @@ def main():
             try:
                 data = audio_queue.get(timeout=0.05)
                 wf.writeframes(data)
+                write_level(data)
             except queue.Empty:
                 pass
 
@@ -89,6 +103,10 @@ def main():
     finally:
         stream.close()
         wf.close()
+        try:
+            os.unlink(LEVEL_FILE)
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     main()
