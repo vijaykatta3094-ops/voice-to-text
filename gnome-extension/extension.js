@@ -5,6 +5,7 @@ import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 // hoot writes this file when recording starts, removes it when done
 const STATE_FILE = '/tmp/hoot.state';
@@ -123,15 +124,15 @@ class HootIndicator extends PanelMenu.Button {
     }
 });
 
-let _indicator = null;
+export default class HootExtension extends Extension {
+    enable() {
+        this._indicator = new HootIndicator();
+        // Place it just left of the system indicators (clock area)
+        Main.panel.addToStatusArea('hoot', this._indicator, 1, 'right');
+    }
 
-export function enable() {
-    _indicator = new HootIndicator();
-    // Place it just left of the system indicators (clock area)
-    Main.panel.addToStatusArea('hoot', _indicator, 1, 'right');
-}
-
-export function disable() {
-    _indicator?.destroy();
-    _indicator = null;
+    disable() {
+        this._indicator?.destroy();
+        this._indicator = null;
+    }
 }
